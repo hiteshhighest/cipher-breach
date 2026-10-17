@@ -1,0 +1,247 @@
+
+--[[
+    CIPHER BREACH - SERVER SCRIPT
+    -----------------------------
+    Responsibilities:
+    1. Create player leaderstats and Credits.
+    2. Start hacking challenges when players interact with the terminal.
+    3. Generate random four-digit access codes.
+    4. Track each player's challenge and deadline.
+    5. Validate submissions on the server.
+    6. Award credits for successful hacks.
+    7. Reject invalid, expired, or duplicate submissions.
+
+    IMPORTANT:
+    The server controls challenge state and rewards.
+    The client must never decide whether a hack succeeds.
+]]
+
+-- Services provide access to Roblox functionality.
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+-- RemoteEvent allows the server and client to communicate.
+-- The server sends challenge information to the client.
+-- The client sends attempted answers back to the server.
+local hackEvent = ReplicatedStorage:WaitForChild("HackEvent")
+
+-- Find the terminal's ProximityPrompt.
+-- WaitForChild prevents the script from failing if the
+-- instance has not replicated or loaded yet.
+local prompt = workspace
+	:WaitForChild("HackingTerminal")
+	:WaitForChild("ProximityPrompt")
+
+
+-- CONFIGURATION
+-- Keeping these values together makes balancing easier.
+local CHALLENGE_DURATION = 20
+local REWARD = 100
+
+
+-- ACTIVE CHALLENGES
+-- Each player can have at most one active challenge.
+--
+-- Example:
+-- activeChallenges[player] = {
+--     code = "0427",
+--     expiresAt = 12345.67
+-- }
+--
+-- os.clock() provides a time reference for calculating
+-- how much time remains before the challenge expires.
+local activeChallenges = {}
+
+
+-- HELPER FUNCTION: GET PLAYER CREDITS
+-- Returns the player's Credits IntValue if it exists.
+-- Returning nil allows the caller to handle missing data
+-- instead of assuming the leaderboard is always available.
+local function getCredits(player)
+	local leaderstats = player:FindFirstChild("leaderstats")
+
+	if not leaderstats then
+		return nil
+	end
+
+	return leaderstats:FindFirstChild("Credits")
+end
+
+
+-- PLAYER INITIALISATION
+-- PlayerAdded fires when a player joins the server.
+-- leaderstats is Roblox's conventional folder name for
+-- displaying player statistics on the built-in leaderboard.
+Players.PlayerAdded:Connect(function(player)
+
+	-- Create the folder that contains leaderboard values.
+	local leaderstats = Instance.new("Folder")
+	leaderstats.Name = "leaderstats"
+	leaderstats.Parent = player
+
+	-- Create a numeric value to store the player's credits.
+	-- This is currently session-only; it is not saved
+	-- permanently when the player leaves.
+	local credits = Instance.new("IntValue")
+	credits.Name = "Credits"
+	credits.Value = 0
+	credits.Parent = leaderstats
+end)
+
+
+-- PLAYER CLEANUP
+-- Remove the player's challenge when they leave.
+-- This prevents abandoned challenge entries from remaining
+-- in the activeChallenges table.
+Players.PlayerRemoving:Connect(function(player)
+	activeChallenges[player] = nil
+end)
+
+
+-- START A HACKING CHALLENGE
+-- Triggered when a player activates the terminal prompt.
+prompt.Triggered:Connect(function(player)
+
+	-- Prevent players from starting multiple challenges
+	-- simultaneously by repeatedly activating the prompt.
+	if activeChallenges[player] then
+		return
+	end
+
+	-- Generate a random integer from 0 to 9999.
+	-- %04d formats the number as exactly four digits.
+	-- For example, 427 becomes "0427".
+	--
+	-- tostring formatting is important because the client
+	-- submits the answer as a string.
+	local challenge = {
+		code = string.format("%04d", math.random(0, 9999)),
+
+		-- Store the absolute expiry time rather than relying
+		-- on the client's displayed countdown.
+		expiresAt = os.clock() + CHALLENGE_DURATION,
+	}
+
+	-- Register the challenge before notifying the client.
+	-- This ensures that a fast client response can find
+	-- the corresponding challenge on the server.
+	activeChallenges[player] = challenge
+
+	-- Send the challenge to the player who activated it.
+	-- FireClient targets one player rather than everyone.
+	--
+	-- NOTE:
+	-- The code is intentionally visible to the client for
+	-- this simple minigame. It is not secret authentication.
+	hackEvent:FireClient(
+		player,
+		"Start",
+		challenge.code,
+		CHALLENGE_DURATION
+	)
+
+	-- Schedule an expiry check.
+	-- task.delay does not pause the entire server script.
+	task.delay(CHALLENGE_DURATION, function()
+
+		-- The challenge might already have been completed
+		-- or removed. Check its identity before expiring it.
+		--
+		-- This also protects against accidentally expiring
+		-- a different challenge created at a later time.
+		if activeChallenges[player] ~= challenge then
+			return
+		end
+
+		-- Remove the challenge so it cannot be submitted again.
+		activeChallenges[player] = nil
+
+		-- Notify the client that the deadline has passed.
+		hackEvent:FireClient(
+			player,
+			"Result",
+			false,
+			"TIME EXPIRED"
+		)
+	end)
+end)
+
+
+-- HANDLE CLIENT SUBMISSIONS
+-- OnServerEvent receives arguments sent by FireServer.
+-- Roblox automatically supplies the actual sending Player
+-- as the first argument.
+hackEvent.OnServerEvent:Connect(function(player, action, answer)
+
+	-- Validate the request's basic structure.
+	-- Never assume client-supplied arguments are trustworthy.
+	if action ~= "Submit" or typeof(answer) ~= "string" then
+		return
+	end
+
+	-- A submission is only valid if a challenge is active.
+	-- This rejects requests sent without starting a hack.
+	local challenge = activeChallenges[player]
+
+	if not challenge then
+		return
+	end
+
+	-- Verify the real server-side deadline.
+	-- A modified client countdown cannot extend the challenge.
+	if os.clock() >= challenge.expiresAt then
+
+		activeChallenges[player] = nil
+
+		hackEvent:FireClient(
+			player,
+			"Result",
+			false,
+			"TIME EXPIRED"
+		)
+
+		return
+	end
+
+	-- Require exactly four numeric characters.
+	-- The pattern rejects letters, spaces and other symbols.
+	-- The length check makes the expected format explicit.
+	if #answer ~= 4 or not answer:match("^%d%d%d%d$") then
+		return
+	end
+
+	-- Consume the challenge before processing the result.
+	-- This prevents repeated submissions from awarding
+	-- multiple rewards for the same challenge.
+	activeChallenges[player] = nil
+
+	-- Compare the submitted code with the server's code.
+	if answer == challenge.code then
+
+		-- Award credits on the server only.
+		local credits = getCredits(player)
+
+		if credits then
+			credits.Value += REWARD
+		end
+
+		-- Tell the client to display the success message.
+		hackEvent:FireClient(
+			player,
+			"Result",
+			true,
+			"ACCESS GRANTED"
+		)
+
+	else
+
+		-- Incorrect codes fail the current challenge.
+		-- No credits are awarded.
+		hackEvent:FireClient(
+			player,
+			"Result",
+			false,
+			"ACCESS DENIED"
+		)
+	end
+end)
